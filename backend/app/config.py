@@ -44,6 +44,7 @@ class Settings(BaseSettings):
             "label": "BANANA 2",
             "engine": "gemini",
             "supports_quality": False,  # качество не выбирается; только размер (1K/2K/4K)
+            "max_size_tier": "2k",      # flash-image не поддерживает 4K — лимит до 2K (замерено на AIGate)
         },
     }
     DEFAULT_IMAGE_MODEL: str = "gpt"
@@ -71,7 +72,7 @@ class Settings(BaseSettings):
 
     IMAGE_QUALITIES: Any = Field(default_factory=lambda: ["low", "medium", "high"])
     IMAGE_FORMATS: Any = Field(default_factory=lambda: ["png", "jpeg", "webp"])
-    IMAGE_ASPECTS: Any = Field(default_factory=lambda: ["1:1", "9:16", "16:9", "4:3", "3:4", "3:2", "2:3", "4:5"])
+    IMAGE_ASPECTS: Any = Field(default_factory=lambda: ["1:1", "9:16", "16:9", "4:3", "3:4", "3:2", "2:3", "4:5", "21:9"])
     IMAGE_SIZE_TIERS: Any = Field(default_factory=lambda: ["standard", "2k", "max"])
     DEFAULT_QUALITY: str = "medium"
     DEFAULT_FORMAT: str = "png"
@@ -81,6 +82,7 @@ class Settings(BaseSettings):
     MAX_UPLOAD_MB: int = 16
     MAX_N_PER_CALL: int = 16                   # лимит n за один вызов
     MAX_REFERENCE_IMAGES: int = 16             # дока: "one or more" без верха — проверить
+    MAX_LIBRARY_REFS: int = 50                 # лимит хранимых референсов на юзера (старые удаляются)
     MAX_IMAGE_LONG_EDGE: int = 3840            # лимит AIGate: длинная сторона ≤ 3840px
     MIN_IMAGE_SHORT_EDGE: int = 768            # лимит AIGate: короткая сторона ≥ ~720px
     MAX_PIXEL_BUDGET: int = 8_300_000          # лимит AIGate: общее число пикселей ≤ ~8.3M
@@ -235,6 +237,21 @@ class Settings(BaseSettings):
         model = self.get_image_model(key)
         return bool(model and model.get("supports_quality"))
 
+    def model_max_size_tier(self, key: str) -> Optional[str]:
+        """Лимит размера для модели (None = без лимита, все tier'ы)."""
+        model = self.get_image_model(key)
+        return model.get("max_size_tier") if model else None
+
+    def effective_size_tier(self, key: str, size_tier: str) -> str:
+        """Реальный tier с учётом лимита модели: если выбран max, а модель не тянет — понижаем до 2k/standard."""
+        cap = self.model_max_size_tier(key)
+        if not cap:
+            return size_tier
+        order = {"standard": 0, "2k": 1, "max": 2}
+        if order.get(size_tier, 0) > order.get(cap, 0):
+            return cap
+        return size_tier
+
     def estimate_price_usd(self, size: str, quality: str, n: int, model_key: str = "gpt") -> float:
         """Оценка цены до запуска.
         gpt: фикс. $ за картинку по quality × n (размер почти не влияет).
@@ -295,6 +312,7 @@ class Settings(BaseSettings):
         "3:2": 3.0 / 2.0,
         "2:3": 2.0 / 3.0,
         "4:5": 4.0 / 5.0,
+        "21:9": 21.0 / 9.0,   # ультраширокий кинематографический
     }
 
     # База — ДЛИННАЯ сторона для каждого уровня размера.

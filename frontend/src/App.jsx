@@ -10,6 +10,8 @@ import {
   fetchConfig,
   fetchHistory,
   fetchKeys,
+  fetchRefs,
+  refUrlToFile,
   setApiKeys,
   submitGeneration,
 } from "./api";
@@ -73,6 +75,9 @@ export default function App() {
   const [keysList, setKeysList] = useState([]); // masked-список пула: [{id,last_four,status}]
   // Просмотр картинки из истории
   const [viewer, setViewer] = useState(null); // {images, index}
+  // Библиотека референсов
+  const [refLibrary, setRefLibrary] = useState(null); // null — закрыта; {list, selected:Set, loading}
+  const [refLibList, setRefLibList] = useState([]);
   const [dragOver, setDragOver] = useState(false);
   const wsRef = useRef(null);
   const estimateTimer = useRef(null);
@@ -165,6 +170,16 @@ export default function App() {
   }, [config, model]);
 
   const supportsQuality = currentModel?.supports_quality !== false;
+  const maxSizeTier = currentModel?.max_size_tier || null; // null = без лимита
+  const tierOrder = { standard: 0, "2k": 1, max: 2 };
+  const tierDisabled = (t) => maxSizeTier && (tierOrder[t] || 0) > (tierOrder[maxSizeTier] || 0);
+
+  // При переключении модели: если выбранный размер превышает лимит модели — понижаем.
+  useEffect(() => {
+    if (tierDisabled(sizeTier)) {
+      setSizeTier(maxSizeTier || "standard");
+    }
+  }, [model, maxSizeTier]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleGenerate = useCallback(async () => {
     setError("");
@@ -205,7 +220,7 @@ export default function App() {
     // references намеренно не восстанавливаем: File-объекты не сериализуются.
   }, []);
 
-  const handleReuseFromImage = useCallback((img) => {
+  const handleReuseFromImage = useCallback(async (img) => {
     if (!img) return;
     setError("");
     if (img.prompt) setPrompt(img.prompt);
@@ -215,10 +230,23 @@ export default function App() {
     if (img.output_format) setOutputFormat(img.output_format);
     if (img.model) setModel(img.model);
     // N по умолчанию оставляем текущий — юзер сам выберет, сколько хочет в этот раз.
-    // references не восстановить — File не сериализуется.
     setViewer(null);          // закрыть просмотрщик
     setTab("generate");       // перейти к генерации
-  }, []);
+
+    // Подтягиваем референсы той картинки (fetch→File), в правильном порядке.
+    const refs = img.references || [];
+    if (refs.length > 0) {
+      try {
+        const sorted = [...refs].sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
+        const files = await Promise.all(
+          sorted.map((r, i) => refUrlToFile(r.url, r.filename || `reference-${i + 1}.png`))
+        );
+        setReferences(files.slice(0, maxRefs));
+      } catch (e) {
+        setError("Не удалось подгрузить референсы: " + errorMessage(e));
+      }
+    }
+  }, [maxRefs]);
 
   const maxRefs = config?.max_references || 16;
 
@@ -226,6 +254,49 @@ export default function App() {
     const arr = Array.from(files || []).filter((f) => f.type.startsWith("image/"));
     setReferences((prev) => [...prev, ...arr].slice(0, maxRefs));
   }, [maxRefs]);
+
+  // === Библиотека референсов ===
+  const openRefLibrary = useCallback(async () => {
+    setRefLibrary({ list: refLibList, selected: new Set(), loading: true });
+    try {
+      const data = await fetchRefs();
+      setRefLibList(data.refs || []);
+      setRefLibrary({ list: data.refs || [], selected: new Set(), loading: false });
+    } catch (e) {
+      setError("Не удалось загрузить библиотеку: " + errorMessage(e));
+      setRefLibrary(null);
+    }
+  }, [refLibList]);
+
+  const toggleRefSelect = useCallback((assetId) => {
+    setRefLibrary((prev) => {
+      if (!prev) return prev;
+      const next = new Set(prev.selected);
+      if (next.has(assetId)) next.delete(assetId);
+      else next.add(assetId);
+      return { ...prev, selected: next };
+    });
+  }, []);
+
+  const addSelectedRefsToPrompt = useCallback(async () => {
+    if (!refLibrary || refLibrary.selected.size === 0) {
+      setRefLibrary(null);
+      return;
+    }
+    const selectedIds = Array.from(refLibrary.selected);
+    try {
+      const files = await Promise.all(
+        selectedIds.map((id) => {
+          const r = refLibrary.list.find((x) => x.id === id);
+          return refUrlToFile(r.url, r.filename || `reference-${id}.png`);
+        })
+      );
+      setReferences((prev) => [...prev, ...files].slice(0, maxRefs));
+      setRefLibrary(null);
+    } catch (e) {
+      setError("Не удалось добавить референсы: " + errorMessage(e));
+    }
+  }, [refLibrary, maxRefs]);
 
   const handleDragEnter = useCallback((e) => {
     e.preventDefault();
@@ -441,15 +512,19 @@ export default function App() {
                 <button
                   key={t}
                   type="button"
-                  className={"tier-pill" + (sizeTier === t ? " active" : "")}
-                  onClick={() => setSizeTier(t)}
+                  className={"tier-pill" + (sizeTier === t ? " active" : "") + (tierDisabled(t) ? " disabled" : "")}
+                  disabled={tierDisabled(t)}
+                  onClick={() => !tierDisabled(t) && setSizeTier(t)}
+                  title={tierDisabled(t) ? "Недоступно для этой модели" : ""}
                 >
-                  {t === "standard" ? "Стандарт" : t === "2k" ? "2K" : "Макс (3.8K)"}
+                  {t === "standard" ? "Стандарт" : t === "2k" ? "2K" : "Макс (4K)"}
                 </button>
               ))}
             </div>
             <div className="hint">
-              Стандарт — быстро и дёшево. 2K — больше деталей. Макс — максимум (до 3840px).
+              {maxSizeTier === "2k"
+                ? "BANANA 2 поддерживает только Стандарт и 2K (4K недоступен для этой модели)."
+                : "Стандарт — быстро и дёшево. 2K — больше деталей. Макс — максимум (до 3840px)."}
             </div>
           </div>
 
@@ -467,8 +542,13 @@ export default function App() {
                 setDragOver(false);
               }}
             />
-            <div className="hint">
-              Порядок = @Image1, @Image2… В промпте ссылайся: «@Image1 — главный герой, @Image2 — фон».
+            <div className="ref-actions">
+              <button type="button" className="btn ghost small" onClick={openRefLibrary}>
+                📚 Мои референсы
+              </button>
+              <span className="hint">
+                Порядок = @Image1, @Image2… В промпте ссылайся: «@Image1 — главный герой, @Image2 — фон».
+              </span>
             </div>
           </div>
 
@@ -538,6 +618,17 @@ export default function App() {
           onClose={() => setViewer(null)}
           onNav={goViewer}
           onReuse={handleReuseFromImage}
+        />
+      )}
+
+      {refLibrary && (
+        <RefLibraryModal
+          list={refLibrary.list}
+          selected={refLibrary.selected}
+          loading={refLibrary.loading}
+          onToggle={toggleRefSelect}
+          onAdd={addSelectedRefsToPrompt}
+          onClose={() => setRefLibrary(null)}
         />
       )}
     </div>
@@ -740,8 +831,8 @@ function PriceCheatSheet({ config, estimateData, n, model, currentModel }) {
   const liveTokens = estimateData?.tokens_estimated;
 
   if (isBanana) {
-    const gp = config?.gemini_price_by_size || { "1K": 0.00902, "2K": 0.01353, "4K": 0.02029 };
-    const sizes = ["1K", "2K", "4K"];
+    const gp = config?.gemini_price_by_size || { "1K": 0.00902, "2K": 0.01353 };
+    const sizes = ["1K", "2K"];   // 4K не поддерживается flash-image — не показываем
     return (
       <div className="cheatsheet">
         <div className="cs-title">BANANA 2 — цена за 1 картинку по размеру</div>
@@ -945,6 +1036,14 @@ function HistoryPanel({ images, jobs, onOpen }) {
   );
 }
 
+function tierLabel(tier) {
+  if (!tier) return "—";
+  if (tier === "standard") return "Стандарт";
+  if (tier === "2k") return "2K";
+  if (tier === "max") return "4K";
+  return tier;
+}
+
 function Viewer({ images, index, onClose, onNav, onReuse }) {
   const img = images[index];
   if (!img) return null;
@@ -959,23 +1058,20 @@ function Viewer({ images, index, onClose, onNav, onReuse }) {
         >
           ♻ Reuse
         </button>
-          <a
-            className="btn small"
-            href={absoluteUrl(img.url)}
-            target="_blank"
-            rel="noreferrer"
-            onClick={(e) => {
-              e.preventDefault();
-              e.stopPropagation();
-              const filename = (img.url && img.url.split("/").pop()) || `image-${index + 1}.png`;
-              downloadUrl(img.url, filename).catch((err) => {
-                console.error("Download failed", err);
-                window.open(absoluteUrl(img.url), "_blank");
-              });
-            }}
-          >
-            ↓ Скачать
-          </a>
+        <button
+          className="btn small"
+          onClick={(e) => {
+            e.stopPropagation();
+            const filename = (img.url && img.url.split("/").pop()) || `image-${index + 1}.png`;
+            downloadUrl(img.url, filename).catch((err) => {
+              console.error("Download failed", err);
+              // последний fallback — открыть в новой вкладке
+              window.open(absoluteUrl(img.url), "_blank");
+            });
+          }}
+        >
+          ↓ Скачать
+        </button>
         <button className="btn small" onClick={onClose}>✕</button>
       </div>
       <div className="viewer-stage" onClick={(e) => e.stopPropagation()}>
@@ -985,10 +1081,58 @@ function Viewer({ images, index, onClose, onNav, onReuse }) {
       </div>
       {img.prompt && (
         <div className="viewer-caption" onClick={(e) => e.stopPropagation()}>
-          <span className="muted">{img.size} · {img.quality}{img.cost_real != null ? ` · $${img.cost_real.toFixed(4)}` : ""}</span>
+          <span className="muted">
+            {(img.model === "banana" ? "BANANA 2" : "GPT IMAGE 2")}
+            {" · "}{img.aspect || "—"}
+            {" · "}{tierLabel(img.size_tier)}
+            {" · "}{img.quality || "—"}
+            {img.output_format ? ` · ${img.output_format}` : ""}
+            {img.cost_real != null ? ` · $${img.cost_real.toFixed(4)}` : ""}
+            {img.n ? ` · ${img.n} шт` : ""}
+          </span>
           <div className="viewer-prompt">{img.prompt}</div>
         </div>
       )}
+    </div>
+  );
+}
+
+function RefLibraryModal({ list, selected, loading, onToggle, onAdd, onClose }) {
+  return (
+    <div className="ref-library" onClick={onClose}>
+      <div className="ref-lib-panel" onClick={(e) => e.stopPropagation()}>
+        <div className="ref-lib-head">
+          <span className="field-label">Мои референсы ({list.length})</span>
+          <span className="hint">клик — выбрать, потом «Добавить»</span>
+          <button className="btn small" onClick={onClose}>✕</button>
+        </div>
+        {loading ? (
+          <div className="hint" style={{ padding: 24, textAlign: "center" }}>Загружаю…</div>
+        ) : list.length === 0 ? (
+          <div className="hint" style={{ padding: 24, textAlign: "center" }}>
+            Библиотека пуста. Загрузите референсы при генерации — они сохранятся сюда.
+          </div>
+        ) : (
+          <div className="ref-lib-grid">
+            {list.map((r) => (
+              <button
+                key={r.id}
+                type="button"
+                className={"ref-lib-cell" + (selected.has(r.id) ? " selected" : "")}
+                onClick={() => onToggle(r.id)}
+              >
+                <img src={absoluteUrl(r.url)} alt={r.filename || ""} loading="lazy" />
+                {selected.has(r.id) && <span className="ref-lib-check">✓</span>}
+              </button>
+            ))}
+          </div>
+        )}
+        <div className="btn-row" style={{ marginTop: 12 }}>
+          <button className="btn primary" disabled={selected.size === 0} onClick={onAdd}>
+            Добавить{selected.size > 0 ? ` (${selected.size})` : ""}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

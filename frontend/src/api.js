@@ -122,6 +122,34 @@ export async function fetchKeys(initData = getInitData()) {
   return payload;
 }
 
+export async function fetchRefs(initData = getInitData()) {
+  const url = `${API_BASE}/api/refs?init_data=${encodeURIComponent(initData)}`;
+  const response = await fetch(url);
+  const payload = await readResponse(response);
+  if (!response.ok) throwResponseError(payload, response.statusText);
+  return payload;
+}
+
+export async function fetchRefFile(assetId, initData = getInitData()) {
+  const url = `${API_BASE}/api/refs/${assetId}/file?init_data=${encodeURIComponent(initData)}`;
+  const response = await fetch(url);
+  if (!response.ok) {
+    const payload = await readResponse(response);
+    throwResponseError(payload, response.statusText);
+  }
+  return response.blob();
+}
+
+/** Скачивает референс по URL и оборачивает в File (для подстановки в references). */
+export async function refUrlToFile(url, filename = "reference.png") {
+  const response = await fetch(absoluteUrl(url));
+  if (!response.ok) throw new Error(`Не удалось загрузить референс: ${response.status}`);
+  const blob = await response.blob();
+  const ext = (filename.split(".").pop() || "png").toLowerCase();
+  const mime = blob.type || "image/png";
+  return new File([blob], filename, { type: mime });
+}
+
 export function connectWebSocket(onMessage) {
   const initData = getInitData();
 
@@ -133,8 +161,34 @@ export function connectWebSocket(onMessage) {
   return websocket;
 }
 
+function isMobileOrTelegram() {
+  // Telegram WebApp или мобильный браузер: там <a download> не работает (iOS игнорирует),
+  // а window.open режется WebView. Там лучше открыть картинку через Telegram.WebApp.openLink.
+  const tg = window.Telegram?.WebApp;
+  if (tg && typeof tg.openLink === "function") return true;
+  if (typeof window.orientation !== "undefined" || /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent)) return true;
+  return false;
+}
+
 export async function downloadUrl(url, filename = "image.png") {
-  const response = await fetch(absoluteUrl(url));
+  const abs = absoluteUrl(url);
+
+  // Мобила / Telegram WebApp: открываем картинку в браузере (openLink для TG,
+  // window.location как fallback). Юзер сохранит долгим тапом — это единственный
+  // надёжный способ скачать на iOS внутри WebView.
+  if (isMobileOrTelegram()) {
+    const tg = window.Telegram?.WebApp;
+    if (tg && typeof tg.openLink === "function") {
+      tg.openLink(abs);
+      return;
+    }
+    // fallback для мобильного браузера вне Telegram
+    window.location.href = abs;
+    return;
+  }
+
+  // Десктоп: качаем через blob + <a download> (работает штатно).
+  const response = await fetch(abs);
   if (!response.ok) {
     throw new Error(`Download failed: ${response.status} ${response.statusText}`);
   }

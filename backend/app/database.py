@@ -152,6 +152,18 @@ class Database:
                 )
                 """
             )
+            # job_references — мост job↔reference_asset с позицией (@Image1, @Image2…)
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS job_references (
+                    job_id TEXT NOT NULL,
+                    asset_id INTEGER NOT NULL,
+                    position INTEGER NOT NULL,
+                    PRIMARY KEY (job_id, position),
+                    FOREIGN KEY (asset_id) REFERENCES reference_assets(id)
+                )
+                """
+            )
             # Миграции колонок — ПОСЛЕ создания всех таблиц.
             await self._ensure_user_columns(db)
             await self._ensure_job_columns(db)
@@ -364,6 +376,103 @@ class Database:
                 active.append(r)
             await db.commit()
             return active
+
+    # ---------------- reference_assets (библиотека референсов) ----------------
+
+    async def save_reference_asset(
+        self,
+        user_db_id: int,
+        *,
+        filename: str,
+        content_type: str,
+        path: str,
+        sha256: str,
+        size: int,
+    ) -> int:
+        """Сохраняет референс в библиотеку с дедупом по sha256.
+        Если у юзера уже есть файл с таким sha256 — возвращает его id, не дублирует."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT id FROM reference_assets WHERE user_id = ? AND sha256 = ?",
+                (user_db_id, sha256),
+            ) as cursor:
+                existing = await cursor.fetchone()
+                if existing:
+                    return int(existing["id"])
+            cur = await db.execute(
+                "INSERT INTO reference_assets (user_id, kind, filename, content_type, path, sha256, size) "
+                "VALUES (?, 'image', ?, ?, ?, ?, ?)",
+                (user_db_id, filename, content_type, path, sha256, size),
+            )
+            await db.commit()
+            return int(cur.lastrowid)
+
+    async def get_user_references(self, user_db_id: int) -> List[Dict[str, Any]]:
+        """Все референсы юзера (для библиотеки), свежие сверху."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT id, filename, content_type, path, size, created_at "
+                "FROM reference_assets WHERE user_id = ? ORDER BY created_at DESC",
+                (user_db_id,),
+            ) as cursor:
+                return [dict(row) for row in await cursor.fetchall()]
+
+    async def get_reference_asset(self, user_db_id: int, asset_id: int) -> Optional[Dict[str, Any]]:
+        """Один референс с проверкой владельца."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM reference_assets WHERE id = ? AND user_id = ?",
+                (asset_id, user_db_id),
+            ) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+
+    async def get_job_references(self, job_id: str) -> List[Dict[str, Any]]:
+        """Референсы конкретного job'а в порядке позиции (для Reuse из истории)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """
+                SELECT a.id, a.filename, a.content_type, a.path, jr.position
+                FROM job_references jr
+                JOIN reference_assets a ON jr.asset_id = a.id
+                WHERE jr.job_id = ?
+                ORDER BY jr.position ASC
+                """,
+                (job_id,),
+            ) as cursor:
+                return [dict(row) for row in await cursor.fetchall()]
+
+    async def link_job_references(self, job_id: str, links: List[tuple]) -> None:
+        """Привязывает референсы к job'у. links = [(asset_id, position), ...]."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.executemany(
+                "INSERT OR REPLACE INTO job_references (job_id, asset_id, position) VALUES (?, ?, ?)",
+                [(job_id, aid, pos) for aid, pos in links],
+            )
+            await db.commit()
+
+    async def cleanup_old_references(self, user_db_id: int, keep: int) -> None:
+        """Оставляет только `keep` свежих референсов, старые удаляет (лимит библиотеки)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                "SELECT id FROM reference_assets WHERE user_id = ? ORDER BY created_at DESC",
+                (user_db_id,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+            if len(rows) <= keep:
+                return
+            drop_ids = [r[0] for r in rows[keep:]]
+            await db.executemany(
+                "DELETE FROM reference_assets WHERE id = ?", [(i,) for i in drop_ids]
+            )
+            await db.executemany(
+                "DELETE FROM job_references WHERE asset_id = ?", [(i,) for i in drop_ids]
+            )
+            await db.commit()
 
     # ---------------- jobs ----------------
 

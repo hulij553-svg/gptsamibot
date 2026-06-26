@@ -199,6 +199,83 @@ a {
 .key-badge.dead { background: #2e1717; color: #d85a5a; }
 .key-row.key-dead { opacity: 0.6; }
 
+/* Библиотека референсов */
+.ref-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 6px;
+  flex-wrap: wrap;
+}
+.ref-actions .hint { flex: 1; min-width: 0; }
+.btn.small {
+  padding: 8px 12px;
+  font-size: 13px;
+  border-radius: 8px;
+}
+
+.ref-library {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.7);
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+}
+.ref-lib-panel {
+  background: var(--bg, #0e0d0c);
+  border: 1px solid var(--line, #2a2825);
+  border-radius: 14px;
+  padding: 14px;
+  width: 100%;
+  max-width: 420px;
+  max-height: 80vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.ref-lib-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.ref-lib-head .field-label { flex: 1; }
+.ref-lib-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+}
+.ref-lib-cell {
+  position: relative;
+  aspect-ratio: 1;
+  border: 2px solid var(--line, #2a2825);
+  border-radius: 8px;
+  overflow: hidden;
+  background: #000;
+  cursor: pointer;
+  padding: 0;
+}
+.ref-lib-cell img { width: 100%; height: 100%; object-fit: cover; }
+.ref-lib-cell.selected { border-color: var(--teal, #2dd4bf); }
+.ref-lib-check {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  background: var(--teal, #2dd4bf);
+  color: #07110e;
+  border-radius: 50%;
+  width: 18px;
+  height: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 800;
+}
+
 .tabs {
   position: sticky;
   top: 0;

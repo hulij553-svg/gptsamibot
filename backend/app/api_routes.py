@@ -21,6 +21,7 @@ from urllib.parse import parse_qsl
 
 import aiohttp
 from fastapi import APIRouter, Form, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
 
 from app.api_client import (
     AIGateClient,
@@ -162,6 +163,55 @@ async def read_reference_files(files: List[Any]) -> List[tuple]:
         out.append((content, file.filename, content_type))
         await file.seek(0)
     return out
+
+
+def _ref_ext(content_type: str, filename: str) -> str:
+    """Расширение файла референса по content_type или имени."""
+    ct_map = {"image/png": "png", "image/jpeg": "jpg", "image/jpg": "jpg", "image/webp": "webp"}
+    ext = ct_map.get((content_type or "").lower())
+    if ext:
+        return ext
+    if filename and "." in filename:
+        return filename.rsplit(".", 1)[-1][:4].lower() or "png"
+    return "png"
+
+
+async def persist_references(
+    user_db_id: int,
+    job_id: str,
+    refs: List[tuple],
+) -> List[tuple]:
+    """Сохраняет референсы в библиотеку (с sha256-дедупом) и привязывает к job'у.
+    refs = [(bytes, filename, content_type), ...]. Возвращает тот же формат (bytes не меняются),
+    чтобы run_generation получил их как раньше. Порядок = @Image1, @Image2… сохраняется."""
+    if not refs:
+        return refs
+    refs_dir = Path(settings.MEDIA_DIR) / "refs" / str(user_db_id)
+    refs_dir.mkdir(parents=True, exist_ok=True)
+
+    links: List[tuple] = []  # [(asset_id, position), ...]
+    for position, (content, filename, content_type) in enumerate(refs):
+        sha = hashlib.sha256(content).hexdigest()
+        ext = _ref_ext(content_type, filename)
+        rel_path = f"refs/{user_db_id}/{sha}.{ext}"
+        abs_path = Path(settings.MEDIA_DIR) / rel_path
+        # Пишем только если файла ещё нет (дедуп на диске).
+        if not abs_path.exists():
+            await asyncio.to_thread(abs_path.write_bytes, content)
+        asset_id = await db.save_reference_asset(
+            user_db_id,
+            filename=filename,
+            content_type=content_type,
+            path=rel_path,
+            sha256=sha,
+            size=len(content),
+        )
+        links.append((asset_id, position))
+
+    await db.link_job_references(job_id, links)
+    # Чистим старые сверх лимита.
+    await db.cleanup_old_references(user_db_id, settings.MAX_LIBRARY_REFS)
+    return refs
 
 
 def public_url(path: str) -> str:
@@ -310,6 +360,7 @@ async def api_config():
                 "label": m["label"],
                 "engine": m["engine"],
                 "supports_quality": m["supports_quality"],
+                "max_size_tier": m.get("max_size_tier"),
             }
             for key, m in settings.IMAGE_MODELS.items()
         ],
@@ -349,6 +400,8 @@ async def api_estimate(
     if aspect not in settings.ASPECT_RATIOS:
         raise HTTPException(status_code=400, detail=f"Unsupported aspect: {aspect}")
     ensure_supported(size_tier, settings.IMAGE_SIZE_TIERS, "size_tier")
+    # Понижаем размер под лимит модели (банана не тянет 4K → 2K).
+    size_tier = settings.effective_size_tier(model, size_tier)
     # quality валидируем только для моделей, которые его поддерживают (gpt)
     if settings.model_supports_quality(model):
         ensure_supported(quality, settings.IMAGE_QUALITIES, "quality")
@@ -475,6 +528,8 @@ async def api_generate(request: Request):
     if aspect not in settings.ASPECT_RATIOS:
         raise HTTPException(status_code=400, detail=f"Unsupported aspect: {aspect}")
     ensure_supported(size_tier, settings.IMAGE_SIZE_TIERS, "size_tier")
+    # Понижаем размер под лимит модели (банана не тянет 4K → 2K).
+    size_tier = settings.effective_size_tier(model, size_tier)
     # quality валидируем только для моделей, которые его поддерживают (gpt)
     if settings.model_supports_quality(model):
         ensure_supported(quality, settings.IMAGE_QUALITIES, "quality")
@@ -509,6 +564,9 @@ async def api_generate(request: Request):
         size_tier=size_tier,
         output_format=output_format,
     )
+
+    # Сохраняем референсы в библиотеку + привязываем к job'у (для Reuse из истории).
+    references = await persist_references(int(user["id"]), job_id, references)
 
     telegram_id = int(user["telegram_id"])
     asyncio.create_task(
@@ -569,6 +627,14 @@ async def api_history(init_data: str = Form(...), limit: int = Form(60)):
     limit = max(1, min(int(limit), 200))
     jobs = await db.get_user_jobs(int(user["telegram_id"]), limit=limit)
     images = await db.get_user_images(int(user["telegram_id"]), limit=limit)
+
+    # Подтягиваем референсы для каждого job'а (для Reuse из истории).
+    # Собираем одним проходом по уникальным job_id, чтобы не плодить N запросов.
+    job_ids = {img["job_id"] for img in images if img.get("job_id")}
+    refs_by_job: Dict[str, List[Dict[str, Any]]] = {}
+    for jid in job_ids:
+        refs_by_job[jid] = await db.get_job_references(jid)
+
     return {
         "jobs": jobs,
         "images": [
@@ -587,10 +653,55 @@ async def api_history(init_data: str = Form(...), limit: int = Form(60)):
                 "size_tier": img.get("size_tier"),
                 "output_format": img.get("output_format"),
                 "n": img.get("n_requested"),
+                "references": [
+                    {
+                        "position": r.get("position", i),
+                        "asset_id": r["id"],
+                        "url": public_url(f"/media/{r['path']}"),
+                        "filename": r.get("filename"),
+                    }
+                    for i, r in enumerate(refs_by_job.get(img["job_id"], []))
+                ],
             }
             for img in images
         ],
     }
+
+
+@router.get("/api/refs")
+async def api_refs(init_data: str = ""):
+    """Библиотека референсов пользователя (список, без бинарников)."""
+    if not init_data:
+        raise HTTPException(status_code=403, detail="init_data required")
+    user = await get_or_create_user(init_data)
+    rows = await db.get_user_references(int(user["id"]))
+    return {
+        "count": len(rows),
+        "refs": [
+            {
+                "id": r["id"],
+                "url": public_url(f"/media/{r['path']}"),
+                "filename": r.get("filename"),
+                "created_at": r.get("created_at"),
+            }
+            for r in rows
+        ],
+    }
+
+
+@router.get("/api/refs/{asset_id}/file")
+async def api_ref_file(asset_id: int, init_data: str = ""):
+    """Отдаёт сам файл референса (для подгрузки в <File> через fetch→blob)."""
+    if not init_data:
+        raise HTTPException(status_code=403, detail="init_data required")
+    user = await get_or_create_user(init_data)
+    asset = await db.get_reference_asset(int(user["id"]), int(asset_id))
+    if not asset:
+        raise HTTPException(status_code=404, detail="Референс не найден")
+    abs_path = Path(settings.MEDIA_DIR) / asset["path"]
+    if not abs_path.exists():
+        raise HTTPException(status_code=404, detail="Файл референса потерян")
+    return FileResponse(str(abs_path), media_type=asset.get("content_type") or "image/png")
 
 
 @router.websocket("/ws")
