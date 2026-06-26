@@ -1,0 +1,14 @@
+.git
+.env
+**/.env
+**/.venv
+**/venv
+**/__pycache__
+**/*.pyc
+**/bot.log
+**/data
+**/media
+**/uploads
+**/node_modules
+**/dist
+**/.vite
