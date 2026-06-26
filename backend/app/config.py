@@ -26,7 +26,49 @@ class Settings(BaseSettings):
 
     # === Провайдер (AIGate-шлюз, OpenAI-совместимый) ===
     PROVIDER_API_BASE: str = "https://api.aigate.shop/v1"
-    IMAGE_MODEL: str = "openai/gpt-image-2"
+    IMAGE_MODEL: str = "openai/gpt-image-2"   # legacy: модель gpt-движка (для совместимости)
+
+    # === Реестр моделей изображения ===
+    # Ключ = внутренний id модели в боте. engine определяет клиента:
+    #   openai → /images/generations|/images/edits (gpt-image-2)
+    #   gemini → /chat/completions (gemini-3.x-image)
+    IMAGE_MODELS: Dict[str, Dict[str, Any]] = {
+        "gpt": {
+            "id": "openai/gpt-image-2",
+            "label": "GPT IMAGE 2",
+            "engine": "openai",
+            "supports_quality": True,   # есть low/medium/high
+        },
+        "banana": {
+            "id": "google/gemini-3.1-flash-image-preview",
+            "label": "BANANA 2",
+            "engine": "gemini",
+            "supports_quality": False,  # качество не выбирается; только размер (1K/2K/4K)
+        },
+    }
+    DEFAULT_IMAGE_MODEL: str = "gpt"
+
+    # size_tier (standard|2k|max) → image_size для Gemini (image_config.image_size).
+    GEMINI_SIZE_MAP: Dict[str, str] = {
+        "standard": "1K",
+        "2k": "2K",
+        "max": "4K",
+    }
+    # Реальные токены за картинку по размеру (замерено на AIGate, 2026-06).
+    # Картинка = фикс. image_tokens, не зависит от промпта.
+    GEMINI_TOKENS_BY_SIZE: Dict[str, int] = {
+        "1K": 1120,
+        "2K": 1680,
+        "4K": 2520,
+    }
+    # Реальная цена за картинку по размеру (из cost_usd ответа AIGate, $).
+    # Промпт почти не влияет (41→113 tok = +$0.00001), ценой диктует размер.
+    GEMINI_PRICE_USD_BY_SIZE: Dict[str, float] = {
+        "1K": 0.00902,
+        "2K": 0.01353,
+        "4K": 0.02029,
+    }
+
     IMAGE_QUALITIES: Any = Field(default_factory=lambda: ["low", "medium", "high"])
     IMAGE_FORMATS: Any = Field(default_factory=lambda: ["png", "jpeg", "webp"])
     IMAGE_ASPECTS: Any = Field(default_factory=lambda: ["1:1", "9:16", "16:9", "4:3", "3:4", "3:2", "2:3", "4:5"])
@@ -170,18 +212,59 @@ class Settings(BaseSettings):
         return {"free": self.TIER_FREE_KEY_SLOTS, "pro": self.TIER_PRO_KEY_SLOTS,
                 "full": self.TIER_FULL_KEY_SLOTS}.get(tier, self.TIER_FREE_KEY_SLOTS)
 
-    def estimate_price_usd(self, size: str, quality: str, n: int) -> float:
-        """Оценка цены до запуска: фикс. $ за картинку по quality × n.
-        ВАЖНО: точная формула AIGate нелинейна (цена не растёт строго с площадью/
-        токенами). Это ОРИЕНТИР — реальный расход смотри в кабинете/по дельте баланса.
-        Базовые цены (1:1 standard, по кабинету): low=$0.0015, med=$0.009, high=$0.012."""
+    # ---------------- Модели изображения ----------------
+
+    def get_image_model(self, key: str) -> Optional[Dict[str, Any]]:
+        return self.IMAGE_MODELS.get(key)
+
+    def is_supported_model(self, key: str) -> bool:
+        return key in self.IMAGE_MODELS
+
+    def model_engine(self, key: str) -> str:
+        model = self.get_image_model(key)
+        return model["engine"] if model else "openai"
+
+    def gemini_image_size(self, size_tier: str) -> str:
+        """size_tier → image_size для image_config Gemini (fallback на 1K)."""
+        return self.GEMINI_SIZE_MAP.get(size_tier, "1K")
+
+    def gemini_tokens_per_image(self, size_tier: str) -> int:
+        return self.GEMINI_TOKENS_BY_SIZE.get(self.gemini_image_size(size_tier), 1250)
+
+    def model_supports_quality(self, key: str) -> bool:
+        model = self.get_image_model(key)
+        return bool(model and model.get("supports_quality"))
+
+    def estimate_price_usd(self, size: str, quality: str, n: int, model_key: str = "gpt") -> float:
+        """Оценка цены до запуска.
+        gpt: фикс. $ за картинку по quality × n (размер почти не влияет).
+        banana: реальная цена по размеру (из замеров cost_usd AIGate) × n.
+        ВАЖНО: это ОРИЕНТИР до запуска — финальный расход AIGate возвращает в cost_usd ответа."""
+        if self.model_engine(model_key) == "gemini":
+            tier = self._size_tier_from_size(size)
+            base = self.GEMINI_PRICE_USD_BY_SIZE.get(self.gemini_image_size(tier), 0.00902)
+            return round(base * n, 4)
         base = self.PRICE_PER_IMAGE_USD.get(quality, self.PRICE_PER_IMAGE_USD["medium"])
         return round(base * n, 4)
 
-    def estimate_tokens(self, size: str, quality: str, n: int) -> int:
-        """Оценка токенов (справочно, для отображения): средние по quality × множитель площади × n."""
+    def estimate_tokens(self, size: str, quality: str, n: int, model_key: str = "gpt") -> int:
+        """Оценка токенов (справочно). gpt — по quality × множитель площади; banana — по размеру × n."""
+        if self.model_engine(model_key) == "gemini":
+            return self.gemini_tokens_per_image(self._size_tier_from_size(size)) * n
         base = self.TOKENS_BY_QUALITY.get(quality, self.TOKENS_BY_QUALITY["medium"])
         return int(base * self._size_area_factor(size) * n)
+
+    def _size_tier_from_size(self, size: str) -> str:
+        """Обратный маппинг WxH → size_tier (для оценки токенов бананы по размеру)."""
+        try:
+            long_edge = max(int(x) for x in size.lower().split("x"))
+        except Exception:
+            return "standard"
+        if long_edge >= 3000:
+            return "max"
+        if long_edge >= 1800:
+            return "2k"
+        return "standard"
 
     def _size_area_factor(self, size: str) -> float:
         try:

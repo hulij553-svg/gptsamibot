@@ -13,6 +13,7 @@ from aiogram.types import CallbackQuery, Message, User
 
 from app import keyboards as kb
 from app.api_client import AIGateClient, AIGateError, format_balance
+from app.api_routes import _parse_keys_multiline, _validate_keys
 from app.config import settings
 from app.database import db
 from app.states import ProfileStates
@@ -37,8 +38,11 @@ async def start_text(from_user: User) -> tuple[str, bool]:
     has_key = bool(user and user.get("api_key"))
     status = "ключ подключён" if has_key else "ключ ещё не подключён"
     text = (
-        "<b>sami studio</b>\n\n"
-        "Генерация картинок через <code>gpt-image-2</code>.\n"
+        "<b>sami studio</b>\n"
+        "Генерация изображений\n\n"
+        "Две модели на выбор в генераторе:\n"
+        "• <b>GPT IMAGE 2</b> — основная, качество low/medium/high\n"
+        "• <b>BANANA 2</b> — Gemini, оплата по токенам\n\n"
         "Генерации списываются с баланса вашего API-ключа.\n\n"
         f"<b>Статус:</b> {status}\n\n"
         "<b>Как начать:</b>\n"
@@ -87,36 +91,53 @@ async def cmd_setkey(message: Message, state: FSMContext):
     await ensure_user(message.from_user)
     await state.set_state(ProfileStates.waiting_api_key)
     await message.answer(
-        "Отправьте API-ключ. Я проверю его через баланс и сохраню только на backend.",
+        "Отправьте API-ключ(и) — можно несколько, по одному на строку.\n"
+        "Валидные сохранятся в пул; параллельные генерации распределятся по ним.",
         reply_markup=kb.cancel_kb(),
     )
 
 
 @router.message(StateFilter(ProfileStates.waiting_api_key), F.text)
 async def process_key(message: Message, state: FSMContext):
-    key = message.text.strip()
-    if key.lower() in {"отмена", "cancel"}:
+    text = message.text.strip()
+    if text.lower() in {"отмена", "cancel"}:
         await state.clear()
         await message.answer("Отменено.", reply_markup=kb.remove_kb())
         await cmd_start(message)
         return
 
-    # Стираем сообщение с ключом из чата сразу — не висит в истории.
+    # Стираем сообщение с ключом(ами) из чата сразу — не висит в истории.
     try:
         await message.delete()
     except Exception:
         pass
 
-    checking = await message.answer("Проверяю ключ…")
+    keys = _parse_keys_multiline(text)
+    if not keys:
+        await message.answer("Не нашёл ни одного ключа. Попробуйте ещё раз.", reply_markup=kb.cancel_kb())
+        return
+
+    checking = await message.answer(f"Проверяю {len(keys)} ключ(ей)…")
     try:
-        balance = await AIGateClient(key).get_balance()
-        await db.set_user_api_key(message.from_user.id, key)
-        await checking.edit_text(
-            f"✅ Ключ подключён.\n\n{format_balance(balance)}",
-            reply_markup=kb.profile_kb(True),
-        )
-    except AIGateError as exc:
-        await checking.edit_text(f"❌ Ключ не прошёл проверку: {exc}")
+        valid, invalid = await _validate_keys(keys)
+        if not valid:
+            detail = "; ".join(f"...{i['key_tail']}: {i['reason']}" for i in invalid) or "проверка не пройдена"
+            await checking.edit_text(f"❌ Ни один ключ не прошёл проверку: {detail}")
+            return
+
+        valid_keys = [k for k, _ in valid]
+        user = await ensure_user(message.from_user)
+        pool_rows = await db.sync_pool_keys(int(user["id"]), valid_keys)
+        await db.set_user_api_key(message.from_user.id, valid_keys[0])
+
+        active = len([r for r in pool_rows if (r.get("status") or "ok") != "dead"])
+        lines = [f"✅ Подключено ключей: {len(pool_rows)} (активны: {active})."]
+        lines.append(format_balance(valid[0][1]))
+        if invalid:
+            lines.append("\nНе прошли проверку:")
+            for i in invalid:
+                lines.append(f"  ...{i['key_tail']}: {i['reason']}")
+        await checking.edit_text("\n".join(lines), reply_markup=kb.profile_kb(True))
     finally:
         await state.clear()
         await message.answer("Готово.", reply_markup=kb.remove_kb())
@@ -134,7 +155,10 @@ async def send_profile(message: Message, from_user: User):
         return
     try:
         balance = await AIGateClient(user["api_key"]).get_balance()
-        await message.answer(f"<b>Профиль</b>\n\n{format_balance(balance)}", reply_markup=kb.profile_kb(True))
+        pool = await db.get_pool_keys(int(user["id"]))
+        active = len([r for r in pool if (r.get("status") or "ok") != "dead"])
+        pool_line = f"\n🔑 Ключей в пуле: {len(pool)} (активны: {active})" if pool else ""
+        await message.answer(f"<b>Профиль</b>{pool_line}\n\n{format_balance(balance)}", reply_markup=kb.profile_kb(True))
     except AIGateError as exc:
         await message.answer(f"Не удалось получить баланс: {exc}", reply_markup=kb.profile_kb(True))
 
@@ -152,10 +176,12 @@ async def send_history(message: Message, from_user: User):
         await message.answer("История пока пустая.", reply_markup=kb.main_menu_kb(has_key, webapp_url()))
         return
     icons = {"queued": "⏳", "generating": "🔄", "saving": "💾", "done": "✅", "failed": "❌", "partial": "⚠️"}
+    labels = {"gpt": "GPT", "banana": "BANANA"}
     lines = ["<b>Последние генерации</b>"]
     for j in jobs:
         icon = icons.get(j["status"], j["status"])
-        lines.append(f"{icon} #{j['id'][:8]} — {j.get('n_done', 0)}/{j.get('n_requested', 0)} · {j.get('size')} · {j.get('quality')}")
+        model_label = labels.get(j.get("model") or "gpt", "GPT")
+        lines.append(f"{icon} #{j['id'][:8]} [{model_label}] — {j.get('n_done', 0)}/{j.get('n_requested', 0)} · {j.get('size')} · {j.get('quality')}")
     await message.answer("\n".join(lines), reply_markup=kb.main_menu_kb(has_key, webapp_url()))
 
 
@@ -187,8 +213,11 @@ async def cb_profile(callback: CallbackQuery):
         return
     try:
         balance = await AIGateClient(user["api_key"]).get_balance()
+        pool = await db.get_pool_keys(int(user["id"]))
+        active = len([r for r in pool if (r.get("status") or "ok") != "dead"])
+        pool_line = f"\n🔑 Ключей в пуле: {len(pool)} (активны: {active})" if pool else ""
         await callback.message.edit_text(
-            f"<b>Профиль</b>\n\n{format_balance(balance)}", reply_markup=kb.profile_kb(True)
+            f"<b>Профиль</b>{pool_line}\n\n{format_balance(balance)}", reply_markup=kb.profile_kb(True)
         )
     except AIGateError as exc:
         await callback.message.edit_text(f"Не удалось получить баланс: {exc}", reply_markup=kb.profile_kb(True))
@@ -204,10 +233,12 @@ async def cb_history(callback: CallbackQuery):
         await callback.message.edit_text("История пока пустая.", reply_markup=kb.main_menu_kb(has_key, webapp_url()))
         return
     icons = {"queued": "⏳", "generating": "🔄", "saving": "💾", "done": "✅", "failed": "❌", "partial": "⚠️"}
+    labels = {"gpt": "GPT", "banana": "BANANA"}
     lines = ["<b>Последние генерации</b>"]
     for j in jobs:
         icon = icons.get(j["status"], j["status"])
-        lines.append(f"{icon} #{j['id'][:8]} — {j.get('n_done', 0)}/{j.get('n_requested', 0)} · {j.get('size')} · {j.get('quality')}")
+        model_label = labels.get(j.get("model") or "gpt", "GPT")
+        lines.append(f"{icon} #{j['id'][:8]} [{model_label}] — {j.get('n_done', 0)}/{j.get('n_requested', 0)} · {j.get('size')} · {j.get('quality')}")
     await callback.message.edit_text("\n".join(lines), reply_markup=kb.main_menu_kb(has_key, webapp_url()))
 
 

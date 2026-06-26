@@ -25,6 +25,7 @@ from fastapi import APIRouter, Form, HTTPException, Request, WebSocket, WebSocke
 from app.api_client import (
     AIGateClient,
     AIGateError,
+    GeminiImageClient,
     GPTImageClient,
     ImageRequest,
     format_balance,
@@ -180,17 +181,20 @@ def images_dir(job_id: str) -> Path:
     return directory
 
 
-def estimate(size: str, quality: str, n: int) -> Dict[str, Any]:
-    """Просчёт цены до запуска: фикс. $ за картинку × множитель площади × n.
-    По факту кабинета AIGate (не по токенам — токены только справочно)."""
-    usd = settings.estimate_price_usd(size, quality, n)
-    tokens = settings.estimate_tokens(size, quality, n)
+def estimate(size: str, quality: str, n: int, model_key: str = "gpt") -> Dict[str, Any]:
+    """Просчёт цены до запуска.
+    gpt — фикс. $ за картинку × множитель площади × n (по факту кабинета).
+    banana — оценка по токенам (по размеру) × ставку $/1k токенов."""
+    usd = settings.estimate_price_usd(size, quality, n, model_key)
+    tokens = settings.estimate_tokens(size, quality, n, model_key)
     return {
         "n": n,
         "total": usd,
         "total_rub": settings.usd_to_rub(usd),
         "currency": "USD",
         "tokens_estimated": tokens,
+        "model": model_key,
+        "engine": settings.model_engine(model_key),
     }
 
 
@@ -200,6 +204,90 @@ def is_transient(exc: AIGateError) -> bool:
 
 def is_dead_key(exc: AIGateError) -> bool:
     return exc.status_code in settings.dead_statuses
+
+
+def is_rate_limited(exc: AIGateError) -> bool:
+    return exc.status_code == 429
+
+
+def _parse_keys_multiline(raw: str) -> List[str]:
+    """Парсит многострочный ввод ключей: трим, дедуп, пустые — прочь."""
+    seen = set()
+    out: List[str] = []
+    for line in (raw or "").splitlines():
+        k = line.strip()
+        if k and k not in seen:
+            seen.add(k)
+            out.append(k)
+    return out
+
+
+async def _validate_keys(keys: List[str]) -> tuple[List[tuple], List[dict]]:
+    """Проверяет каждый ключ через get_balance().
+    Возвращает (valid=[(key, balance_dict), ...], invalid=[{key_tail, reason}, ...])."""
+    valid: List[tuple] = []
+    invalid: List[dict] = []
+    for k in keys:
+        try:
+            balance = await AIGateClient(k).get_balance()
+            valid.append((k, balance))
+        except AIGateError as exc:
+            invalid.append({"key_tail": k[-4:], "reason": str(exc)})
+        except Exception as exc:  # noqa: BLE001 — любая сетевая/прочая ошибка
+            invalid.append({"key_tail": k[-4:], "reason": str(exc) or "network error"})
+    return valid, invalid
+
+
+class KeyPool:
+    """Раздаёт ключи чанкам round-robin и управляет failover на время одного джоба.
+
+    Потокобезопасность: asyncio.run в одном процессе; чанки конкурентны через gather,
+    но назначения делаются в event-loop (нет抢占 между await внутри assign), поэтому
+    простой счётчик + множества достаточны без lock.
+    """
+
+    def __init__(self, pool: List[Dict[str, Any]]):
+        # pool — строки из БД (id, api_key, status, ...). На вход приходят только активные.
+        self._items: List[tuple] = [(int(p["id"]), p["api_key"]) for p in pool]
+        self._idx = 0
+        self._suspended: set = set()   # key_id в cooldown (временно недоступны)
+        self._dead: set = set()        # key_id мёртвые (до конца джоба)
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def _available(self) -> List[tuple]:
+        return [(kid, k) for kid, k in self._items if kid not in self._suspended and kid not in self._dead]
+
+    def assign(self) -> Optional[tuple]:
+        """Выдаёт следующий доступный ключ (key_id, api_key). None, если доступных нет."""
+        avail = self._available()
+        if not avail:
+            return None
+        # round-robin по доступным
+        n = len(self._items)
+        for _ in range(n):
+            kid, k = self._items[self._idx % n]
+            self._idx = (self._idx + 1) % n
+            if kid not in self._suspended and kid not in self._dead:
+                return kid, k
+        return None
+
+    def fallback(self, excluded_key_id: Optional[int]) -> Optional[tuple]:
+        """Ключ для ретрая, отличный от excluded. None, если доступных нет."""
+        avail = self._available()
+        if excluded_key_id is not None:
+            avail = [(kid, k) for kid, k in avail if kid != excluded_key_id]
+        return avail[0] if avail else None
+
+    def suspend(self, key_id: int):
+        self._suspended.add(key_id)
+
+    def kill(self, key_id: int):
+        self._dead.add(key_id)
+
+    def has_available(self) -> bool:
+        return bool(self._available())
 
 
 # ============================================================
@@ -215,6 +303,17 @@ async def health():
 async def api_config():
     return {
         "model": settings.IMAGE_MODEL,
+        "image_models": [
+            {
+                "key": key,
+                "id": m["id"],
+                "label": m["label"],
+                "engine": m["engine"],
+                "supports_quality": m["supports_quality"],
+            }
+            for key, m in settings.IMAGE_MODELS.items()
+        ],
+        "default_image_model": settings.DEFAULT_IMAGE_MODEL,
         "aspects": list(settings.ASPECT_RATIOS.keys()),
         "size_tiers": settings.IMAGE_SIZE_TIERS,
         "default_aspect": settings.DEFAULT_ASPECT,
@@ -230,34 +329,49 @@ async def api_config():
         "provider_base": settings.PROVIDER_API_BASE,
         "usd_to_rub": settings.USD_TO_RUB,
         "price_per_image": settings.PRICE_PER_IMAGE_USD,
+        "gemini_price_by_size": settings.GEMINI_PRICE_USD_BY_SIZE,
+        "gemini_tokens_by_size": settings.GEMINI_TOKENS_BY_SIZE,
     }
 
 
 @router.post("/api/estimate")
 async def api_estimate(
     init_data: str = Form(...),
+    model: str = Form(settings.DEFAULT_IMAGE_MODEL),
     aspect: str = Form(settings.DEFAULT_ASPECT),
     size_tier: str = Form(settings.DEFAULT_SIZE_TIER),
     quality: str = Form(settings.DEFAULT_QUALITY),
     n: int = Form(1),
 ):
     await get_or_create_user(init_data)
+    if not settings.is_supported_model(model):
+        raise HTTPException(status_code=400, detail=f"Unsupported model: {model}")
     if aspect not in settings.ASPECT_RATIOS:
         raise HTTPException(status_code=400, detail=f"Unsupported aspect: {aspect}")
     ensure_supported(size_tier, settings.IMAGE_SIZE_TIERS, "size_tier")
-    ensure_supported(quality, settings.IMAGE_QUALITIES, "quality")
+    # quality валидируем только для моделей, которые его поддерживают (gpt)
+    if settings.model_supports_quality(model):
+        ensure_supported(quality, settings.IMAGE_QUALITIES, "quality")
     n = max(1, min(int(n), settings.MAX_N_PER_CALL))
     size = settings.aspect_to_size(aspect, size_tier)
-    return estimate(size, quality, n)
+    return estimate(size, quality, n, model)
 
 
 @router.post("/api/balance")
 async def api_balance(init_data: str = Form(...)):
     user = await get_or_create_user(init_data)
-    if not user.get("api_key"):
-        return {"has_key": False, "balance": None, "raw": None}
+    pool_rows = await db.get_pool_keys(int(user["id"]))
+    active = await db.get_active_pool_keys(int(user["id"]))
+    pool_info = {
+        "count": len(pool_rows),
+        "active_count": len(active),
+    }
+    if not user.get("api_key") and not pool_rows:
+        return {"has_key": False, "balance": None, "raw": None, "pool": pool_info}
+    # Баланс — по primary-ключу (users.api_key), как раньше.
+    primary_key = user.get("api_key") or (pool_rows[0]["api_key"] if pool_rows else "")
     try:
-        balance = await AIGateClient(user["api_key"]).get_balance()
+        balance = await AIGateClient(primary_key).get_balance()
         # balance от AIGate: {balance: <usd>, ...}
         usd = float(balance.get("balance", 0) or 0)
         return {
@@ -266,24 +380,75 @@ async def api_balance(init_data: str = Form(...)):
             "balance_usd": usd,
             "balance_rub": round(usd * settings.USD_TO_RUB, 2),
             "raw": balance,
+            "pool": pool_info,
         }
     except AIGateError as exc:
-        return {"has_key": True, "balance": None, "raw": None, "error": str(exc)}
+        return {"has_key": True, "balance": None, "raw": None, "error": str(exc), "pool": pool_info}
+
+
+@router.get("/api/keys")
+async def api_keys(init_data: str = ""):
+    """Masked-список пула ключей пользователя (без plaintext)."""
+    if not init_data:
+        raise HTTPException(status_code=403, detail="init_data required")
+    user = await get_or_create_user(init_data)
+    rows = await db.get_pool_keys(int(user["id"]))
+    now_ts = time.time()
+    keys = []
+    active_count = 0
+    for r in rows:
+        status = r.get("status") or "ok"
+        on_cooldown = False
+        if status == "cooldown":
+            try:
+                on_cooldown = float(r.get("cooldown_until") or 0) > now_ts
+            except (TypeError, ValueError):
+                on_cooldown = False
+        if status == "ok" or (status == "cooldown" and not on_cooldown):
+            active_count += 1
+        keys.append({
+            "id": r["id"],
+            "last_four": r.get("last_four") or (r["api_key"][-4:] if r.get("api_key") else ""),
+            "status": "cooldown" if (status == "cooldown" and on_cooldown) else status,
+        })
+    return {"count": len(rows), "active_count": active_count, "keys": keys}
 
 
 @router.post("/api/setkey")
-async def api_setkey(init_data: str = Form(...), api_key: str = Form(...)):
+async def api_setkey(init_data: str = Form(...), api_keys: str = Form(...)):
+    """Принимает несколько ключей (multiline). Валидирует каждый, синхронизирует пул.
+    Невалидные возвращает в ответе. users.api_key = первый валидный (primary)."""
     user = await get_or_create_user(init_data)
-    api_key = api_key.strip()
-    if len(api_key) < 16:
-        raise HTTPException(status_code=400, detail="Ключ выглядит слишком коротким")
+    keys = _parse_keys_multiline(api_keys)
+    if not keys:
+        raise HTTPException(status_code=400, detail="Нет ни одного ключа")
+    for k in keys:
+        if len(k) < 16:
+            raise HTTPException(status_code=400, detail=f"Ключ ...{k[-4:]} выглядит слишком коротким")
 
-    try:
-        balance = await AIGateClient(api_key).get_balance()
-        await db.set_user_api_key(int(user["telegram_id"]), api_key)
-        return {"success": True, "balance": format_balance(balance), "raw": balance}
-    except AIGateError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+    valid, invalid = await _validate_keys(keys)
+    if not valid:
+        detail = "; ".join(f"...{i['key_tail']}: {i['reason']}" for i in invalid) or "ни один ключ не прошёл проверку"
+        raise HTTPException(status_code=400, detail=f"Ни один ключ не прошёл проверку: {detail}")
+
+    valid_keys = [k for k, _ in valid]
+    pool_rows = await db.sync_pool_keys(int(user["id"]), valid_keys)
+    # primary = первый валидный (для /api/balance и бэкофиса).
+    await db.set_user_api_key(int(user["telegram_id"]), valid_keys[0])
+
+    primary_balance = valid[0][1]
+    return {
+        "success": True,
+        "count": len(pool_rows),
+        "active_count": len([r for r in pool_rows if (r.get("status") or "ok") != "dead"]),
+        "balance": format_balance(primary_balance),
+        "raw": primary_balance,
+        "invalid": invalid,
+        "pool": [
+            {"id": r["id"], "last_four": r.get("last_four"), "status": r.get("status") or "ok"}
+            for r in pool_rows
+        ],
+    }
 
 
 @router.post("/api/generate")
@@ -291,6 +456,7 @@ async def api_generate(request: Request):
     form = await request.form()
     init_data = form_text(form, "init_data")
     prompt = form_text(form, "prompt").strip()
+    model = form_text(form, "model", settings.DEFAULT_IMAGE_MODEL)
     aspect = form_text(form, "aspect", settings.DEFAULT_ASPECT)
     size_tier = form_text(form, "size_tier", settings.DEFAULT_SIZE_TIER)
     quality = form_text(form, "quality", settings.DEFAULT_QUALITY)
@@ -304,17 +470,21 @@ async def api_generate(request: Request):
         raise HTTPException(status_code=400, detail="Промпт не может быть пустым")
     if len(prompt) > settings.MAX_PROMPT_LENGTH:
         raise HTTPException(status_code=400, detail=f"Промпт длиннее {settings.MAX_PROMPT_LENGTH} символов")
+    if not settings.is_supported_model(model):
+        raise HTTPException(status_code=400, detail=f"Unsupported model: {model}")
     if aspect not in settings.ASPECT_RATIOS:
         raise HTTPException(status_code=400, detail=f"Unsupported aspect: {aspect}")
     ensure_supported(size_tier, settings.IMAGE_SIZE_TIERS, "size_tier")
-    ensure_supported(quality, settings.IMAGE_QUALITIES, "quality")
+    # quality валидируем только для моделей, которые его поддерживают (gpt)
+    if settings.model_supports_quality(model):
+        ensure_supported(quality, settings.IMAGE_QUALITIES, "quality")
     ensure_supported(output_format, settings.IMAGE_FORMATS, "output_format")
 
     size = settings.aspect_to_size(aspect, size_tier)
 
-    # Ключ пользователя (как в оригинале). Общий ключ/пул/тарифы — позже.
-    api_key = user.get("api_key")
-    if not api_key:
+    # Пул ключей пользователя (многопоточность + failover). Берём активные.
+    pool = await db.get_active_pool_keys(int(user["id"]))
+    if not pool:
         raise HTTPException(status_code=400, detail="Сначала подключите API-ключ")
 
     if n < 1 or n > settings.MAX_N_PER_CALL:
@@ -323,7 +493,7 @@ async def api_generate(request: Request):
     # Референсы (порядок = @Image1, @Image2, ...). Читаем в память.
     references = await read_reference_files(reference_files)
 
-    est = estimate(size, quality, n)
+    est = estimate(size, quality, n, model)
     job_id = await db.create_job(
         user_db_id=int(user["id"]),
         prompt=prompt,
@@ -334,6 +504,10 @@ async def api_generate(request: Request):
         estimate_total=est["total"],
         used_shared_key=False,
         references_count=len(references),
+        model=model,
+        aspect=aspect,
+        size_tier=size_tier,
+        output_format=output_format,
     )
 
     telegram_id = int(user["telegram_id"])
@@ -341,19 +515,22 @@ async def api_generate(request: Request):
         run_generation(
             job_id=job_id,
             telegram_id=telegram_id,
-            api_key=api_key,
+            pool=pool,
             prompt=prompt,
             size=size,
             quality=quality,
-            output_format=output_format,
             n=n,
+            output_format=output_format,
             references=references,
+            model_key=model,
+            aspect_ratio=aspect,
+            size_tier=size_tier,
         )
     )
 
     return {
         "job_id": job_id, "status": "queued", "estimate": est,
-        "aspect": aspect, "size": size, "size_tier": size_tier,
+        "model": model, "aspect": aspect, "size": size, "size_tier": size_tier,
         "references_count": len(references),
     }
 
@@ -405,6 +582,11 @@ async def api_history(init_data: str = Form(...), limit: int = Form(60)):
                 "size": img.get("size"),
                 "quality": img.get("quality"),
                 "cost_real": img.get("cost_real"),
+                "model": img.get("model") or "gpt",
+                "aspect": img.get("aspect"),
+                "size_tier": img.get("size_tier"),
+                "output_format": img.get("output_format"),
+                "n": img.get("n_requested"),
             }
             for img in images
         ],
@@ -449,22 +631,37 @@ async def run_generation(
     *,
     job_id: str,
     telegram_id: int,
-    api_key: str,
+    pool: List[Dict[str, Any]],
     prompt: str,
     size: str,
     quality: str,
     n: int,
     output_format: str = "png",
     references: Optional[List[tuple]] = None,
+    model_key: str = "gpt",
+    aspect_ratio: Optional[str] = None,
+    size_tier: str = "standard",
 ):
-    client = GPTImageClient(api_key)
+    # Клиент и размер чанка зависят от движка модели. api_key подставляется per-чанк из пула.
+    engine = settings.model_engine(model_key)
+    if engine == "gemini":
+        chunk_size = 1  # Gemini отдаёт 1 картинку за вызов; N картинок = N вызовов
+        image_size = settings.gemini_image_size(size_tier)
+        make_client = lambda api_key: GeminiImageClient(api_key)
+    else:
+        chunk_size = settings.CHUNK_SIZE
+        image_size = None
+        make_client = lambda api_key: GPTImageClient(api_key)
+
     ext = output_format if output_format in {"png", "jpeg", "webp"} else "png"
     references = references or []
+    keypool = KeyPool(pool)
 
-    # Баланс ДО — для расчёта реальной цены (дельта) в конце.
+    # Баланс ДО — для расчёта реальной цены (дельта) в конце. По primary (первому) ключу.
     balance_before: Optional[float] = None
     try:
-        bal = await AIGateClient(api_key).get_balance()
+        primary_key = pool[0]["api_key"]
+        bal = await AIGateClient(primary_key).get_balance()
         balance_before = float(bal.get("balance", 0) or 0)
     except Exception:
         pass
@@ -475,7 +672,7 @@ async def run_generation(
         progress=5, done_count=0, total_count=n,
     )
 
-    chunks = _split_chunks(n, settings.CHUNK_SIZE)
+    chunks = _split_chunks(n, chunk_size)
     sem = asyncio.Semaphore(settings.CHUNK_CONCURRENCY)
 
     # shared mutable state
@@ -483,28 +680,40 @@ async def run_generation(
     all_previews: List[str] = []
     chunk_errors: List[str] = []
 
-    async def run_chunk(start_index: int, chunk_size: int) -> str:
+    async def run_chunk(start_index: int, this_chunk_size: int) -> str:
         async with sem:
+            assigned = keypool.assign()
+            if assigned is None:
+                err_msg = "Все ключи недоступны (rate-limit/баланс). Попробуйте позже или добавьте ключи."
+                chunk_errors.append(err_msg)
+                state["failed"] += this_chunk_size
+                return "failed"
+            key_id, api_key = assigned
+
             for attempt in range(settings.MAX_RETRIES):
                 if is_job_cancelled(job_id):
                     return "cancelled"
                 try:
+                    client = make_client(api_key)
                     logger.info(
-                        "Generating chunk: job=%s chunk_size=%s refs=%s ref_sizes=%s size=%s quality=%s",
-                        job_id, chunk_size, len(references),
+                        "Generating chunk: job=%s model=%s chunk_size=%s key=%s refs=%s ref_sizes=%s size=%s quality=%s",
+                        job_id, model_key, this_chunk_size, key_id, len(references),
                         [len(r[0]) for r in references] if references else [],
                         size, quality,
                     )
                     result = await client.generate(ImageRequest(
-                        prompt=prompt, size=size, quality=quality, n=chunk_size,
+                        prompt=prompt, size=size, quality=quality, n=this_chunk_size,
                         output_format=output_format,
                         reference_images=references,
+                        model_key=model_key,
+                        aspect_ratio=aspect_ratio,
+                        image_size=image_size,
                     ))
                     images_b64 = [b64 for b64 in result.images_b64 if b64]
                     if not images_b64:
                         logger.warning(
                             "AIGate returned empty images: job=%s chunk_size=%s data_keys=%s data_len=%s raw=%s",
-                            job_id, chunk_size,
+                            job_id, this_chunk_size,
                             list(result.raw.keys()) if isinstance(result.raw, dict) else type(result.raw).__name__,
                             len(result.raw.get("data", [])) if isinstance(result.raw, dict) else 0,
                             str(result.raw)[:400],
@@ -531,6 +740,9 @@ async def run_generation(
                     state["cost_usd"] = state.get("cost_usd", 0.0) + cost_usd_chunk
                     all_previews.extend(chunk_previews)
 
+                    # Ключ отработал чисто — сбросим cooldown, если был.
+                    await db.clear_key_status(key_id)
+
                     pct = int(state["done"] / n * 100) if n else 100
                     await manager.send_progress(
                         telegram_id, job_id, "generating",
@@ -543,7 +755,29 @@ async def run_generation(
                     if is_job_cancelled(job_id):
                         return "cancelled"
                     err_msg = str(exc) or f"AIGate error {exc.status_code}"
-                    if is_transient(exc) and attempt < settings.MAX_RETRIES - 1:
+
+                    # === Failover по пулу ===
+                    if is_rate_limited(exc):
+                        # 429 — ключ в cooldown, пробуем другой.
+                        await db.mark_key_cooldown(key_id, 30)
+                        keypool.suspend(key_id)
+                        fallback = keypool.fallback(key_id)
+                        if fallback is not None and attempt < settings.MAX_RETRIES - 1:
+                            key_id, api_key = fallback
+                            logger.warning("Key %s rate-limited, switching to key %s (job=%s)", key_id, api_key[-4:], job_id)
+                            await asyncio.sleep(min(settings.RETRY_BACKOFF_MAX, settings.RETRY_BACKOFF_BASE * (2 ** attempt)))
+                            continue
+                    elif is_dead_key(exc):
+                        # 401/403 — ключ мёртв, исключаем до след. синхронизации.
+                        await db.mark_key_dead(key_id)
+                        keypool.kill(key_id)
+                        fallback = keypool.fallback(key_id)
+                        if fallback is not None and attempt < settings.MAX_RETRIES - 1:
+                            key_id, api_key = fallback
+                            logger.warning("Key %s dead, switching to key %s (job=%s)", key_id, api_key[-4:], job_id)
+                            continue
+                    elif is_transient(exc) and attempt < settings.MAX_RETRIES - 1:
+                        # Прочие 5xx/502/503 — ретрай на том же ключе с backoff.
                         backoff = min(settings.RETRY_BACKOFF_MAX, settings.RETRY_BACKOFF_BASE * (2 ** attempt))
                         await manager.send_progress(
                             telegram_id, job_id, "generating",
@@ -554,11 +788,11 @@ async def run_generation(
                         await asyncio.sleep(backoff)
                         continue
                     chunk_errors.append(err_msg)
-                    state["failed"] += chunk_size
+                    state["failed"] += this_chunk_size
                     logger.warning("Chunk failed (AIGateError): job=%s status=%s msg=%s", job_id, exc.status_code, err_msg)
                     await manager.send_progress(
                         telegram_id, job_id, "generating",
-                        f"Чанк ({chunk_size} шт) не вышел: {err_msg}",
+                        f"Чанк ({this_chunk_size} шт) не вышел: {err_msg}",
                         done_count=state["done"], total_count=n,
                     )
                     return "failed"
@@ -566,10 +800,10 @@ async def run_generation(
                     err_msg = f"Таймаут генерации (>{settings.GENERATION_TIMEOUT}с). Попробуй меньший размер или quality."
                     logger.warning("Chunk timeout: job=%s timeout=%ss", job_id, settings.GENERATION_TIMEOUT)
                     chunk_errors.append(err_msg)
-                    state["failed"] += chunk_size
+                    state["failed"] += this_chunk_size
                     await manager.send_progress(
                         telegram_id, job_id, "generating",
-                        f"Чанк ({chunk_size} шт) не вышел: {err_msg}",
+                        f"Чанк ({this_chunk_size} шт) не вышел: {err_msg}",
                         done_count=state["done"], total_count=n,
                     )
                     return "failed"
@@ -577,7 +811,7 @@ async def run_generation(
                     err_msg = str(exc) or f"{type(exc).__name__} (без сообщения)"
                     logger.exception("Chunk failed unexpectedly for %s: %s", job_id, err_msg)
                     chunk_errors.append(err_msg)
-                    state["failed"] += chunk_size
+                    state["failed"] += this_chunk_size
                     return "failed"
             return "failed"
 

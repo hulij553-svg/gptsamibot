@@ -69,11 +69,11 @@ export async function fetchBalance() {
   return postForm("/api/balance");
 }
 
-export async function estimate({ aspect, size_tier, quality, n }) {
-  return postForm("/api/estimate", { aspect, size_tier, quality, n });
+export async function estimate({ aspect, size_tier, quality, n, model }) {
+  return postForm("/api/estimate", { aspect, size_tier, quality, n, model });
 }
 
-export async function submitGeneration({ prompt, aspect, size_tier, quality, output_format, n, references }) {
+export async function submitGeneration({ prompt, aspect, size_tier, quality, output_format, n, references, model }) {
   const form = new FormData();
   form.append("init_data", getInitData());
   form.append("prompt", prompt);
@@ -82,6 +82,7 @@ export async function submitGeneration({ prompt, aspect, size_tier, quality, out
   form.append("quality", quality);
   form.append("output_format", output_format);
   form.append("n", n);
+  form.append("model", model);
   if (references && references.length) {
     for (const file of references) form.append("references", file);
   }
@@ -105,7 +106,20 @@ export async function fetchHistory(limit = 20) {
 }
 
 export async function setApiKey(apiKey) {
-  return postForm("/api/setkey", { api_key: apiKey });
+  // backward-compat alias
+  return setApiKeys(apiKey);
+}
+
+export async function setApiKeys(apiKeysMultiline) {
+  return postForm("/api/setkey", { api_keys: apiKeysMultiline });
+}
+
+export async function fetchKeys(initData = getInitData()) {
+  const url = `${API_BASE}/api/keys?init_data=${encodeURIComponent(initData)}`;
+  const response = await fetch(url);
+  const payload = await readResponse(response);
+  if (!response.ok) throwResponseError(payload, response.statusText);
+  return payload;
 }
 
 export function connectWebSocket(onMessage) {

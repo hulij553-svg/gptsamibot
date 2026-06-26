@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import json
+import base64
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -17,6 +18,14 @@ import aiohttp
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+def _is_size_error(exc: "AIGateError") -> bool:
+    """ True, если ошибка намекает, что размер/качество не поддерживается —
+    значит стоит попробовать меньший image_size."""
+    msg = (exc.message or "").lower()
+    needles = ("size", "too large", "too big", "not support", "unsupported", "4k", "2k", "max", "resolution")
+    return any(n in msg for n in needles)
 
 
 def stringify_error(value: Any) -> str:
@@ -163,12 +172,16 @@ def format_balance(data: Dict[str, Any]) -> str:
 class ImageRequest:
     prompt: str
     size: str = "1024x1024"
-    quality: str = "medium"            # low|medium|high
+    quality: str = "medium"            # low|medium|high (только для openai-движка)
     n: int = 1
     resolution: Optional[str] = None   # 1k|2k|4k — опц. подсказка из доки AIGate
     output_format: Optional[str] = None  # png|jpeg|webp — forward модели "when supported"
     # Референсы «как у официалов»: файлы напрямую (multipart). Порядок = @Image1...
     reference_images: List[tuple] = field(default_factory=list)  # [(bytes, filename, content_type), ...]
+    # === Поля для Gemini-движка ===
+    model_key: str = "gpt"             # gpt | banana
+    aspect_ratio: Optional[str] = None  # "16:9" и т.п. — для image_config Gemini
+    image_size: Optional[str] = None    # "1K"|"2K"|"4K" — для image_config Gemini
 
 
 @dataclass
@@ -249,3 +262,128 @@ class GPTImageClient(AIGateClient):
             usage=data.get("usage", {}),
             raw=data,
         )
+
+
+# ============================================================
+# Image generation: gemini-3.x-image (BANANA) через /chat/completions
+# ============================================================
+
+# Размер тега «если модель не тянет 4K» — пробуем понижать до 2K.
+_GEMINI_SIZE_FALLBACK = {"4K": "2K", "2K": "1K", "1K": "1K"}
+
+
+def _data_url_to_b64(url: str) -> str:
+    """data:image/png;base64,XXXX → XXXX. Не-data-URL возвращает пустую строку."""
+    if not url:
+        return ""
+    marker = ";base64,"
+    idx = url.find(marker)
+    if idx < 0:
+        return ""
+    return url[idx + len(marker):]
+
+
+def _mime_from_bytes(content: bytes) -> str:
+    """Грубое определение mime по сигнатуре (для data URL референсов)."""
+    if content.startswith(b"\x89PNG"):
+        return "image/png"
+    if content.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/png"
+
+
+class GeminiImageClient(AIGateClient):
+    """Генерация картинок через /chat/completions (gemini-3.x-image).
+
+    Контракт AIGate: messages + modalities:["image","text"] + image_config.
+    Возвращает choices[0].message.images[].image_url.url (data URL base64).
+    Одна картинка за вызов — N картинок = N вызовов (на уровне чанков).
+    """
+
+    async def generate(self, req: ImageRequest) -> ImageResult:
+        model = settings.get_image_model(req.model_key)
+        model_id = model["id"] if model else "google/gemini-3.1-flash-image-preview"
+        image_size = req.image_size or settings.gemini_image_size("standard")
+
+        # Пробуем запрошенный размер; при ошибке понижаем до 2K/1K (4K поддерживается не всеми моделями).
+        last_exc: Optional[AIGateError] = None
+        tried_sizes: List[str] = []
+        current = image_size
+        while True:
+            tried_sizes.append(current)
+            try:
+                return await self._call(model_id, req, current)
+            except AIGateError as exc:
+                # Понижаем размер только при ошибках, намекающих на неподдерживаемый размер/слишком большой запрос.
+                if not _is_size_error(exc) or current == "1K" or current == _GEMINI_SIZE_FALLBACK.get(current):
+                    raise
+                last_exc = exc
+                current = _GEMINI_SIZE_FALLBACK[current]
+                logger.warning("Gemini size fallback: %s → %s (job model=%s)", tried_sizes[-1], current, req.model_key)
+
+    async def _call(self, model_id: str, req: ImageRequest, image_size: str) -> ImageResult:
+        payload: Dict[str, Any] = {
+            "model": model_id,
+            "messages": [self._build_message(req)],
+            "modalities": ["image", "text"],
+        }
+        image_config: Dict[str, Any] = {"image_size": image_size}
+        if req.aspect_ratio:
+            image_config["aspect_ratio"] = req.aspect_ratio
+        payload["image_config"] = image_config
+
+        data = await self._request("POST", "/chat/completions", timeout=settings.GENERATION_TIMEOUT, json=payload)
+
+        images_b64 = self._extract_images(data)
+        if not images_b64:
+            raise AIGateError(
+                "Gemini вернул пустой ответ (нет картинок)",
+                status_code=None,
+                payload=data,
+            )
+        return ImageResult(
+            images_b64=images_b64,
+            model=model_id,
+            usage=self._extract_usage(data),
+            raw=data,
+        )
+
+    def _build_message(self, req: ImageRequest) -> Dict[str, Any]:
+        """Собирает user-сообщение. С референсами — content-массив (редактирование)."""
+        if not req.reference_images:
+            return {"role": "user", "content": req.prompt}
+        parts: List[Dict[str, Any]] = [{"type": "text", "text": req.prompt}]
+        for content, _filename, content_type in req.reference_images:
+            mime = content_type or _mime_from_bytes(content)
+            b64 = base64.b64encode(content).decode("ascii")
+            parts.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime};base64,{b64}"},
+            })
+        return {"role": "user", "content": parts}
+
+    @staticmethod
+    def _extract_images(data: Dict[str, Any]) -> List[str]:
+        """choices[0].message.images[].image_url.url → список base64."""
+        choices = data.get("choices") or []
+        if not choices:
+            return []
+        message = choices[0].get("message") or {}
+        images = message.get("images") or []
+        out: List[str] = []
+        for item in images:
+            if not isinstance(item, dict):
+                continue
+            url = (item.get("image_url") or {}).get("url")
+            b64 = _data_url_to_b64(url) if url else ""
+            out.append(b64)
+        return out
+
+    @staticmethod
+    def _extract_usage(data: Dict[str, Any]) -> Dict[str, Any]:
+        usage = data.get("usage") or {}
+        if isinstance(usage, dict):
+            return usage
+        return {}

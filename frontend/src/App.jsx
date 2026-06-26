@@ -9,7 +9,8 @@ import {
   fetchBalance,
   fetchConfig,
   fetchHistory,
-  setApiKey,
+  fetchKeys,
+  setApiKeys,
   submitGeneration,
 } from "./api";
 
@@ -23,10 +24,33 @@ const STAGE_LABEL = {
   partial: "Частично",
 };
 
+// === Reuse settings: последняя конфигурация генерации в localStorage ===
+const SETTINGS_KEY = "sami.lastSettings";
+
+function loadLastSettings() {
+  try {
+    const raw = localStorage.getItem(SETTINGS_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveLastSettings(s) {
+  try {
+    // references (File) в localStorage не кладём — только текстовые настройки.
+    const { references, ...rest } = s;
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(rest));
+  } catch {
+    /* localStorage может быть недоступен — игнорируем */
+  }
+}
+
 export default function App() {
   const [config, setConfig] = useState(null);
   const [balance, setBalance] = useState(null);
   const [prompt, setPrompt] = useState("");
+  const [model, setModel] = useState("gpt");
   const [aspect, setAspect] = useState("1:1");
   const [sizeTier, setSizeTier] = useState("standard");
   const [quality, setQuality] = useState("medium");
@@ -46,6 +70,7 @@ export default function App() {
   const [keyBusy, setKeyBusy] = useState(false);
   const [keyError, setKeyError] = useState("");
   const [keyOk, setKeyOk] = useState("");
+  const [keysList, setKeysList] = useState([]); // masked-список пула: [{id,last_four,status}]
   // Просмотр картинки из истории
   const [viewer, setViewer] = useState(null); // {images, index}
   const [dragOver, setDragOver] = useState(false);
@@ -58,14 +83,28 @@ export default function App() {
     fetchConfig()
       .then((cfg) => {
         setConfig(cfg);
+        // Сначала дефолты из конфига…
+        setModel(cfg.default_image_model || "gpt");
         setAspect(cfg.default_aspect || "1:1");
         setSizeTier(cfg.default_size_tier || "standard");
         setQuality(cfg.default_quality || "medium");
         setOutputFormat(cfg.default_format || "png");
+        // …затем перекрываем последними сохранёнными настройками юзера (reuse).
+        const last = loadLastSettings();
+        if (last) {
+          if (last.model) setModel(last.model);
+          if (last.aspect) setAspect(last.aspect);
+          if (last.sizeTier) setSizeTier(last.sizeTier);
+          if (last.quality) setQuality(last.quality);
+          if (last.outputFormat) setOutputFormat(last.outputFormat);
+          if (last.prompt) setPrompt(last.prompt);
+          if (last.n) setN(last.n);
+        }
       })
       .catch((e) => setError(errorMessage(e)));
     refreshBalance();
     refreshHistory();
+    refreshKeys();
   }, []);
 
   const refreshBalance = () => fetchBalance().then(setBalance).catch(() => {});
@@ -106,18 +145,26 @@ export default function App() {
     setEstimateLoading(true);
     clearTimeout(estimateTimer.current);
     estimateTimer.current = setTimeout(() => {
-      estimate({ aspect, size_tier: sizeTier, quality, n })
+      estimate({ aspect, size_tier: sizeTier, quality, n, model })
         .then((d) => setEstimateData(d))
         .catch(() => setEstimateData(null))
         .finally(() => setEstimateLoading(false));
     }, 250);
     return () => clearTimeout(estimateTimer.current);
-  }, [aspect, sizeTier, quality, n, config]);
+  }, [aspect, sizeTier, quality, n, model, config]);
 
   const maxN = useMemo(() => {
     if (!config) return 10;
     return config.max_n_per_call || 10;
   }, [config]);
+
+  // Конфиг текущей модели (engine, supports_quality, label).
+  const currentModel = useMemo(() => {
+    const list = config?.image_models || [];
+    return list.find((m) => m.key === model) || list[0] || { key: "gpt", engine: "openai", supports_quality: true, label: "GPT IMAGE 2" };
+  }, [config, model]);
+
+  const supportsQuality = currentModel?.supports_quality !== false;
 
   const handleGenerate = useCallback(async () => {
     setError("");
@@ -126,7 +173,9 @@ export default function App() {
       return;
     }
     try {
-      const res = await submitGeneration({ prompt, aspect, size_tier: sizeTier, quality, output_format: outputFormat, n, references });
+      const res = await submitGeneration({ prompt, aspect, size_tier: sizeTier, quality, output_format: outputFormat, n, references, model });
+      // Сохраняем настройки генерации для reuse (references не кладём — это File).
+      saveLastSettings({ prompt, aspect, sizeTier, quality, outputFormat, n, model });
       setActiveJobs((prev) => {
         const idx = Object.keys(prev).length + 1;
         return {
@@ -137,7 +186,39 @@ export default function App() {
     } catch (e) {
       setError(errorMessage(e));
     }
-  }, [prompt, aspect, sizeTier, quality, outputFormat, n, references]);
+  }, [prompt, aspect, sizeTier, quality, outputFormat, n, references, model]);
+
+  const handleReuse = useCallback(() => {
+    const last = loadLastSettings();
+    if (!last) {
+      setError("Нет сохранённых настроек — запустите генерацию хотя бы раз");
+      return;
+    }
+    setError("");
+    if (last.prompt) setPrompt(last.prompt);
+    if (last.aspect) setAspect(last.aspect);
+    if (last.sizeTier) setSizeTier(last.sizeTier);
+    if (last.quality) setQuality(last.quality);
+    if (last.outputFormat) setOutputFormat(last.outputFormat);
+    if (last.model) setModel(last.model);
+    if (last.n) setN(last.n);
+    // references намеренно не восстанавливаем: File-объекты не сериализуются.
+  }, []);
+
+  const handleReuseFromImage = useCallback((img) => {
+    if (!img) return;
+    setError("");
+    if (img.prompt) setPrompt(img.prompt);
+    if (img.aspect) setAspect(img.aspect);
+    if (img.size_tier) setSizeTier(img.size_tier);
+    if (img.quality) setQuality(img.quality);
+    if (img.output_format) setOutputFormat(img.output_format);
+    if (img.model) setModel(img.model);
+    // N по умолчанию оставляем текущий — юзер сам выберет, сколько хочет в этот раз.
+    // references не восстановить — File не сериализуется.
+    setViewer(null);          // закрыть просмотрщик
+    setTab("generate");       // перейти к генерации
+  }, []);
 
   const maxRefs = config?.max_references || 16;
 
@@ -214,25 +295,43 @@ export default function App() {
     });
   }, []);
 
+  const refreshKeys = useCallback(() => {
+    fetchKeys()
+      .then((data) => setKeysList(data.keys || []))
+      .catch(() => setKeysList([]));
+  }, []);
+
   const handleSetKey = useCallback(async () => {
     setKeyError("");
     setKeyOk("");
-    if (keyInput.trim().length < 16) {
-      setKeyError("Ключ выглядит слишком коротким");
+    const raw = keyInput.trim();
+    if (!raw) {
+      setKeyError("Вставьте хотя бы один ключ");
+      return;
+    }
+    const lines = raw.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+    if (lines.some((k) => k.length < 16)) {
+      setKeyError("Один из ключей выглядит слишком коротким");
       return;
     }
     setKeyBusy(true);
     try {
-      const res = await setApiKey(keyInput.trim());
-      setKeyOk(res.balance || "Ключ подключён");
+      const res = await setApiKeys(raw);
+      const okParts = [`✅ Подключено ключей: ${res.count} (активны: ${res.active_count})`];
+      if (res.balance) okParts.push(res.balance);
+      if (res.invalid && res.invalid.length) {
+        okParts.push("Не прошли: " + res.invalid.map((i) => `…${i.key_tail}`).join(", "));
+      }
+      setKeyOk(okParts.join("\n"));
       setKeyInput("");
+      setKeysList(res.pool || []);
       refreshBalance();
     } catch (e) {
       setKeyError(errorMessage(e));
     } finally {
       setKeyBusy(false);
     }
-  }, [keyInput]);
+  }, [keyInput, refreshBalance]);
 
   const hasKey = Boolean(balance?.has_key);
 
@@ -274,25 +373,43 @@ export default function App() {
 
       <div className="tabs">
         <button className={tab === "generate" ? "tab active" : "tab"} onClick={() => setTab("generate")}>Генерация</button>
+        <button className={tab === "keys" ? "tab active" : "tab"} onClick={() => setTab("keys")}>API-ключи</button>
         <button className={tab === "history" ? "tab active" : "tab"} onClick={() => setTab("history")}>История</button>
       </div>
 
       {error && <div className="alert danger">{error}</div>}
 
       {tab === "generate" && hasKey && (
-        <PriceCheatSheet config={config} estimateData={estimateData} n={n} />
+        <PriceCheatSheet config={config} estimateData={estimateData} n={n} model={model} currentModel={currentModel} />
       )}
 
       {tab === "generate" && !hasKey && (
+        <div className="panel">
+          <h2>Подключите API-ключ</h2>
+          <p className="hint">
+            Чтобы генерировать картинки, подключите ключ AIGate. Можно несколько —
+            для многопоточности и надёжности.
+          </p>
+          <button className="btn primary" onClick={() => setTab("keys")}>Перейти к API-ключам</button>
+        </div>
+      )}
+
+      {tab === "keys" && (
         <KeyPanel
           keyInput={keyInput} setKeyInput={setKeyInput}
           keyBusy={keyBusy} keyError={keyError} keyOk={keyOk}
+          keysList={keysList}
           onSubmit={handleSetKey}
         />
       )}
 
       {tab === "generate" && hasKey && (
         <div className="panel">
+          <ModelSwitch
+            models={config?.image_models || []}
+            value={model}
+            onChange={setModel}
+          />
           <PromptField
             value={prompt}
             onChange={setPrompt}
@@ -389,6 +506,9 @@ export default function App() {
             <button className="btn primary" disabled={!prompt.trim()} onClick={handleGenerate}>
               Сгенерировать
             </button>
+            <button className="btn ghost" onClick={handleReuse} title="Подгрузить промпт и настройки последней генерации">
+              ♻ Reuse
+            </button>
             {Object.values(activeJobs).some((d) => ["done", "failed", "partial", "cancelled"].includes(d.progress?.stage)) && (
               <button className="btn ghost" onClick={handleClearFinished}>
                 Очистить завершённые
@@ -412,7 +532,13 @@ export default function App() {
       )}
 
       {viewer && (
-        <Viewer images={viewer.images} index={viewer.index} onClose={() => setViewer(null)} onNav={goViewer} />
+        <Viewer
+          images={viewer.images}
+          index={viewer.index}
+          onClose={() => setViewer(null)}
+          onNav={goViewer}
+          onReuse={handleReuseFromImage}
+        />
       )}
     </div>
   );
@@ -603,13 +729,43 @@ function PromptField({ value, onChange, references, maxLen }) {
   );
 }
 
-function PriceCheatSheet({ config, estimateData, n }) {
+function PriceCheatSheet({ config, estimateData, n, model, currentModel }) {
+  const isBanana = (currentModel?.engine === "gemini");
   const pp = config?.price_per_image || { low: 0.0015, medium: 0.009, high: 0.012 };
   const rub = config?.usd_to_rub || 92;
   const toRub = (usd) => usd * rub;
-  // Живой просчёт под текущий выбор (берём из estimateData, если есть)
+  // Живой просчёт под текущий выбор
   const liveRub = estimateData?.total_rub;
   const liveUsd = estimateData?.total;
+  const liveTokens = estimateData?.tokens_estimated;
+
+  if (isBanana) {
+    const gp = config?.gemini_price_by_size || { "1K": 0.00902, "2K": 0.01353, "4K": 0.02029 };
+    const sizes = ["1K", "2K", "4K"];
+    return (
+      <div className="cheatsheet">
+        <div className="cs-title">BANANA 2 — цена за 1 картинку по размеру</div>
+        <div className="cs-row">
+          {sizes.map((s) => (
+            <div key={s} className="cs-cell">
+              <span className="cs-q">{s}</span>
+              <span className="cs-price">{toRub(gp[s]).toFixed(2)} ₽</span>
+              <span className="cs-usd">${gp[s].toFixed(4)}</span>
+            </div>
+          ))}
+        </div>
+        <div className="cs-live">
+          {liveRub != null ? (
+            <>Сейчас ({n} шт): <b>≈ {liveRub.toFixed(2)} ₽</b> <span className="muted">(${(liveUsd || 0).toFixed(4)})</span></>
+          ) : (
+            <span className="muted">Выбери параметры — покажу цену</span>
+          )}
+          <span className="cs-note"> · промпт почти не влияет на цену — её задаёт размер</span>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="cheatsheet">
       <div className="cs-title">Цены за 1 картинку (стандартный размер)</div>
@@ -634,8 +790,30 @@ function PriceCheatSheet({ config, estimateData, n }) {
   );
 }
 
+function ModelSwitch({ models, value, onChange }) {
+  if (!models || models.length === 0) return null;
+  return (
+    <div className="field">
+      <span className="field-label">Модель</span>
+      <div className="model-pills">
+        {models.map((m) => (
+          <button
+            key={m.key}
+            type="button"
+            className={"model-pill" + (value === m.key ? " active" : "")}
+            onClick={() => onChange(m.key)}
+          >
+            {m.label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function TopBar({ balance, config }) {
   const hasKey = Boolean(balance?.has_key);
+  const poolCount = balance?.pool?.count || 0;
   let balanceText = "нет ключа";
   if (hasKey) {
     const usd = balance?.balance_usd;
@@ -656,39 +834,55 @@ function TopBar({ balance, config }) {
           sami studio
           <span className="version-badge">v7</span>
         </h1>
-        <div className="eyebrow">gpt-image-2</div>
+        <div className="eyebrow">генерация изображений</div>
       </div>
       <div className={"key-chip" + (hasKey ? " ready" : "")}>
+        {poolCount > 1 && <span className="pool-badge" title={`Пул из ${poolCount} ключей — многопоточность`}>🔑{poolCount}</span>}
         {balanceText}
       </div>
     </div>
   );
 }
 
-function KeyPanel({ keyInput, setKeyInput, keyBusy, keyError, keyOk, onSubmit }) {
+function KeyPanel({ keyInput, setKeyInput, keyBusy, keyError, keyOk, keysList, onSubmit }) {
+  const statusLabel = { ok: "активен", cooldown: "cooldown", dead: "мёртв" };
+  const hasKeys = keysList && keysList.length > 0;
   return (
     <div className="panel">
       <div className="key-intro">
-        <h2>Подключите API-ключ</h2>
+        <h2>{hasKeys ? "API-ключи" : "Подключите API-ключ(и)"}</h2>
         <p className="hint">
-          Генерации списываются с баланса вашего ключа. Зарегистрируйтесь
-          на <a href="https://aigate.shop" target="_blank" rel="noreferrer">aigate.shop</a>,
-          пополните баланс и скопируйте API-ключ из кабинета.
+          {hasKeys
+            ? "Добавьте ещё ключи — параллельные генерации распределятся по ним. "
+            : "Генерации списываются с баланса вашего ключа. Можно добавить несколько — параллельные генерации распределятся по ним. "}
+          Зарегистрируйтесь на <a href="https://aigate.shop" target="_blank" rel="noreferrer">aigate.shop</a>,
+          пополните баланс и скопируйте API-ключ(и) из кабинета.
         </p>
       </div>
       {keyError && <div className="alert danger">{keyError}</div>}
       {keyOk && <div className="alert success">{keyOk}</div>}
       <label className="field">
-        <span className="field-label">API-ключ</span>
-        <input
-          className="input"
-          type="password"
-          placeholder="sk-..."
+        <span className="field-label">{hasKeys ? "Добавить ключи — по одному на строку" : "API-ключи — по одному на строку"}</span>
+        <textarea
+          className="input textarea"
+          placeholder={"sk-...\nsk-...\nsk-..."}
           value={keyInput}
           onChange={(e) => setKeyInput(e.target.value)}
           autoComplete="off"
+          rows={5}
         />
       </label>
+      {keysList && keysList.length > 0 && (
+        <div className="key-pool-list">
+          <span className="field-label">Пул ключей ({keysList.length})</span>
+          {keysList.map((k) => (
+            <div key={k.id} className={"key-row key-" + (k.status || "ok")}>
+              <span className="key-tail">••••{k.last_four}</span>
+              <span className={"key-badge " + (k.status || "ok")}>{statusLabel[k.status] || k.status}</span>
+            </div>
+          ))}
+        </div>
+      )}
       <button className="btn primary" disabled={keyBusy || keyInput.trim().length < 16} onClick={onSubmit}>
         {keyBusy ? "Проверяю…" : "Подключить"}
       </button>
@@ -751,13 +945,20 @@ function HistoryPanel({ images, jobs, onOpen }) {
   );
 }
 
-function Viewer({ images, index, onClose, onNav }) {
+function Viewer({ images, index, onClose, onNav, onReuse }) {
   const img = images[index];
   if (!img) return null;
   return (
     <div className="viewer" onClick={onClose}>
       <div className="viewer-bar" onClick={(e) => e.stopPropagation()}>
         <span className="viewer-info">{index + 1} / {images.length}</span>
+        <button
+          className="btn small ghost"
+          onClick={(e) => { e.stopPropagation(); onReuse && onReuse(img); }}
+          title="Подгрузить настройки этой картинки в генератор"
+        >
+          ♻ Reuse
+        </button>
           <a
             className="btn small"
             href={absoluteUrl(img.url)}
