@@ -220,6 +220,8 @@ export default function App() {
     // references намеренно не восстанавливаем: File-объекты не сериализуются.
   }, []);
 
+  const maxRefs = config?.max_references || 16;
+
   const handleReuseFromImage = useCallback(async (img) => {
     if (!img) return;
     setError("");
@@ -247,8 +249,6 @@ export default function App() {
       }
     }
   }, [maxRefs]);
-
-  const maxRefs = config?.max_references || 16;
 
   const handleAddReferences = useCallback((files) => {
     const arr = Array.from(files || []).filter((f) => f.type.startsWith("image/"));
